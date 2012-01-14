@@ -15,10 +15,10 @@
 
 # Minimization routines
 
-__all__ = ['fmin', 'fmin_powell', 'fmin_bfgs', 'fmin_ncg', 'fmin_cg',
-           'fminbound', 'brent', 'golden', 'bracket', 'rosen', 'rosen_der',
-           'rosen_hess', 'rosen_hess_prod', 'brute', 'approx_fprime',
-           'line_search', 'check_grad']
+__all__ = ['fmin', 'fmin_powell', 'fmin_bfgs', 'fmin_sr1', 'fmin_ncg',
+           'fmin_cg', 'fminbound', 'brent', 'golden', 'bracket', 'rosen',
+           'rosen_der', 'rosen_hess', 'rosen_hess_prod', 'brute',
+           'approx_fprime', 'line_search', 'check_grad']
 
 __docformat__ = "restructuredtext en"
 
@@ -435,8 +435,191 @@ def approx_fhess_p(x0, p, fprime, epsilon, *args):
     f1 = fprime(*((x0,) + args))
     return (f2 - f1) / epsilon
 
-
 def fmin_bfgs(f, x0, fprime=None, args=(), gtol=1e-5, norm=Inf,
+              epsilon=_epsilon, maxiter=None, full_output=0, disp=1,
+              retall=0, callback=None):
+    """Minimize a function using the BFGS algorithm.
+
+    Parameters
+    ----------
+    f : callable f(x,*args)
+        Objective function to be minimized.
+    x0 : ndarray
+        Initial guess.
+    fprime : callable f'(x,*args)
+        Gradient of f.
+    args : tuple
+        Extra arguments passed to f and fprime.
+    gtol : float
+        Gradient norm must be less than gtol before succesful termination.
+    norm : float
+        Order of norm (Inf is max, -Inf is min)
+    epsilon : int or ndarray
+        If fprime is approximated, use this value for the step size.
+    callback : callable
+        An optional user-supplied function to call after each
+        iteration.  Called as callback(xk), where xk is the
+        current parameter vector.
+
+    Returns
+    -------
+    xopt : ndarray
+        Parameters which minimize f, i.e. f(xopt) == fopt.
+    fopt : float
+        Minimum value.
+    gopt : ndarray
+        Value of gradient at minimum, f'(xopt), which should be near 0.
+    Bopt : ndarray
+        Value of 1/f''(xopt), i.e. the inverse hessian matrix.
+    func_calls : int
+        Number of function_calls made.
+    grad_calls : int
+        Number of gradient calls made.
+    warnflag : integer
+        1 : Maximum number of iterations exceeded.
+        2 : Gradient and/or function calls not changing.
+    allvecs  :  list
+        Results at each iteration.  Only returned if retall is True.
+
+    Other Parameters
+    ----------------
+    maxiter : int
+        Maximum number of iterations to perform.
+    full_output : bool
+        If True,return fopt, func_calls, grad_calls, and warnflag
+        in addition to xopt.
+    disp : bool
+        Print convergence message if True.
+    retall : bool
+        Return a list of results at each iteration if True.
+
+    Notes
+    -----
+    Optimize the function, f, whose gradient is given by fprime
+    using the quasi-Newton method of Broyden, Fletcher, Goldfarb,
+    and Shanno (BFGS)
+
+    References
+    ----------
+    Wright, and Nocedal 'Numerical Optimization', 1999, pg. 198.
+
+    """
+    x0 = asarray(x0).flatten()
+    if x0.ndim == 0:
+        x0.shape = (1,)
+    if maxiter is None:
+        maxiter = len(x0)*200
+    func_calls, f = wrap_function(f, args)
+    if fprime is None:
+        grad_calls, myfprime = wrap_function(approx_fprime, (f, epsilon))
+    else:
+        grad_calls, myfprime = wrap_function(fprime, args)
+    gfk = myfprime(x0)
+    k = 0
+    N = len(x0)
+    I = numpy.eye(N, dtype=int)
+    Hk = I
+    old_fval = f(x0)
+    old_old_fval = old_fval + 5000
+    xk = x0
+    if retall:
+        allvecs = [x0]
+    sk = [2*gtol]
+    warnflag = 0
+    gnorm = vecnorm(gfk, ord=norm)
+    while (gnorm > gtol) and (k < maxiter):
+        pk = -numpy.dot(Hk, gfk)
+        alpha_k, fc, gc, old_fval2, old_old_fval2, gfkp1 = \
+           line_search_wolfe1(f, myfprime, xk, pk, gfk,
+                              old_fval, old_old_fval)
+        if alpha_k is not None:
+            old_fval = old_fval2
+            old_old_fval = old_old_fval2
+        else:
+            # line search failed: try different one.
+            alpha_k, fc, gc, old_fval, old_old_fval, gfkp1 = \
+                     line_search_wolfe2(f, myfprime, xk, pk, gfk,
+                                        old_fval, old_old_fval)
+            if alpha_k is None:
+                # This line search also failed to find a better solution.
+                warnflag = 2
+                break
+        xkp1 = xk + alpha_k * pk
+        if retall:
+            allvecs.append(xkp1)
+        sk = xkp1 - xk
+        xk = xkp1
+        if gfkp1 is None:
+            gfkp1 = myfprime(xkp1)
+
+        yk = gfkp1 - gfk
+        gfk = gfkp1
+        if callback is not None:
+            callback(xk)
+        k += 1
+        gnorm = vecnorm(gfk, ord=norm)
+        if (gnorm <= gtol):
+            break
+
+        if not numpy.isfinite(old_fval):
+            # We correctly found +-Inf as optimal value, or something went
+            # wrong.
+            warnflag = 2
+            break
+
+        try:  #this was handled in numeric, let it remaines for more safety
+            rhok = 1.0 / (numpy.dot(yk, sk))
+        except ZeroDivisionError:
+            rhok = 1000.0
+            print "Divide-by-zero encountered: rhok assumed large"
+        if isinf(rhok):  #this is patch for numpy
+            rhok = 1000.0
+            print "Divide-by-zero encountered: rhok assumed large"
+        A1 = I - sk[:, numpy.newaxis] * yk[numpy.newaxis, :] * rhok
+        A2 = I - yk[:, numpy.newaxis] * sk[numpy.newaxis, :] * rhok
+        Hk = numpy.dot(A1, numpy.dot(Hk, A2)) + rhok * sk[:, numpy.newaxis] \
+                * sk[numpy.newaxis, :]
+
+    if disp or full_output:
+        fval = old_fval
+    if warnflag == 2:
+        if disp:
+            print "Warning: Desired error not necessarily achieved" \
+                  "due to precision loss"
+            print "         Current function value: %f" % fval
+            print "         Iterations: %d" % k
+            print "         Function evaluations: %d" % func_calls[0]
+            print "         Gradient evaluations: %d" % grad_calls[0]
+
+    elif k >= maxiter:
+        warnflag = 1
+        if disp:
+            print "Warning: Maximum number of iterations has been exceeded"
+            print "         Current function value: %f" % fval
+            print "         Iterations: %d" % k
+            print "         Function evaluations: %d" % func_calls[0]
+            print "         Gradient evaluations: %d" % grad_calls[0]
+    else:
+        if disp:
+            print "Optimization terminated successfully."
+            print "         Current function value: %f" % fval
+            print "         Iterations: %d" % k
+            print "         Function evaluations: %d" % func_calls[0]
+            print "         Gradient evaluations: %d" % grad_calls[0]
+
+    if full_output:
+        retlist = xk, fval, gfk, Hk, func_calls[0], grad_calls[0], warnflag
+        if retall:
+            retlist += (allvecs,)
+    else:
+        retlist = xk
+        if retall:
+            retlist = (xk, allvecs)
+
+    return retlist
+
+
+def fmin_sr1(f, x0, fprime=None, args=(), gtol=1e-5, norm=Inf,
               epsilon=_epsilon, maxiter=None, full_output=0, disp=1,
               retall=0, callback=None):
     """Minimize a function using the BFGS algorithm.
